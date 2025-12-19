@@ -1,0 +1,186 @@
+import xml.etree.ElementTree as ET
+import pandas as pd
+import re
+from datetime import date, timedelta
+import os
+
+# ==========================================================================
+# ⚙️ 환경 설정 (Configuration)
+# ==========================================================================
+
+# 🌟 마스킹 문자 설정: ' ' (공백) 또는 '_' (언더바) 중 선택
+MASKING_CHAR = '_'
+
+# 1. 대상 기간 설정: 태조 2년 (1393년)
+# 시작 날짜 (포함)
+START_DATE_KOREAN = "태조 2년 3월 1일"
+START_DATE_ISO = date(1393, 3, 1)
+
+# 종료 날짜 (미포함, 7월 31일까지 추출하려면 8월 1일을 지정)
+END_DATE_KOREAN = "태조 2년 7월 31일"
+EXCLUSIVE_END_DATE_ISO = date(1393, 8, 1)
+
+# 처리할 XML 파일 목록 (파일 경로는 환경에 맞게 수정 필요)
+XML_FILES_TO_PROCESS = ['2nd_waa_102.xml']
+
+# 최종 출력 파일명
+OUTPUT_FILENAME = 'a020701_한문원문_최종마스킹_.tsv'
+
+# ==========================================================================
+# 🔧 핵심 함수 (Core Functions)
+# ==========================================================================
+
+def get_target_dates_id_list(start_date, exclusive_end_date):
+    """
+    주어진 기간에 해당하는 7자리 실록 날짜 ID (YYMMDDD, 예: '0204001') 리스트를 생성합니다.
+    - 태조 2년 (02)에 대해서만 작동합니다.
+    """
+    date_id_list = set()
+    current_date = start_date
+    # exclusive_end_date 직전 날짜까지 반복
+    while current_date < exclusive_end_date:
+        # 7자리 ID 형식: 02 (태조 2년) + MM (월 2자리) + DDD (일 3자리)
+        sillok_date_id = f"02{current_date.month:02d}{current_date.day:03d}"
+        date_id_list.add(sillok_date_id)
+        current_date += timedelta(days=1)
+    return date_id_list
+
+def parse_xml_for_sillok_data(file_path, target_date_ids, masking_char):
+    """
+    XML 파일에서 지정된 날짜 범위의 기사를 추출하고, 한문 원문의 <index> 부분을 마스킹합니다.
+    """
+    extracted_data = []
+
+    # 1. XML 파일 로드 및 오류 처리
+    try:
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        print(f"\n✅ 파일 로드 성공: {file_path}")
+    except FileNotFoundError:
+        print(f"\n❌ 오류: 파일을 찾을 수 없습니다. 경로를 확인해주세요: {file_path}")
+        return []
+    except ET.ParseError:
+        print(f"\n❌ 오류: XML 파싱에 실패했습니다. 파일 구조가 손상되었을 수 있습니다: {file_path}")
+        return []
+
+    print("--- 날짜 필터링 및 텍스트 마스킹 진행 중 ---")
+
+    # 2. 모든 기사(level5) 반복 처리
+    for article in root.findall('.//level5'):
+        article_id = article.get('id')
+
+        # ID 유효성 검사 (ID가 없거나, 날짜 부분 추출이 불가능한 짧은 ID는 건너뜀)
+        if not article_id or len(article_id) < 12:
+            continue
+
+        # ID에서 7자리 날짜 부분 추출 (YYMMDDD)
+        date_id_seven_digits = article_id[5:12]
+
+        # 3. 날짜 범위 필터링
+        if date_id_seven_digits in target_date_ids:
+
+            # 4. 기사 제목 추출
+            title_element = article.find('./front/biblioData/title/mainTitle')
+            title = title_element.text.strip() if title_element is not None and title_element.text else "제목 없음"
+
+            # 5. 한문 원문 추출 및 마스킹 처리
+            paragraph_element = article.find('./text/content/paragraph')
+            chinese_text = ""
+
+            if paragraph_element is not None:
+                # <paragraph> 태그와 그 내용을 포함하여 문자열로 변환
+                raw_text = ET.tostring(paragraph_element, encoding='unicode')
+
+                # 🌟 마스킹 로직: <index...> 태그와 그 안의 내용(한자 주석) 전체를 마스킹 문자로 치환
+                # re.DOTALL: . 문자가 개행문자(\n)도 포함하도록 설정하여 다중 라인 매칭 가능
+                cleaned_text = re.sub(r'<index[^>]*>.*?</index>', masking_char, raw_text, flags=re.DOTALL)
+
+                # <annotation> 태그 및 내용 제거 (일반적인 XML 주석 태그)
+                cleaned_text = re.sub(r'<annotation[^>]*>.*?</annotation>', '', cleaned_text, flags=re.DOTALL)
+
+                # <paragraph> 태그 자체 제거 및 기타 불필요한 XML/HTML 엔티티 정리
+                # ".*?:/" 부분은 실록 데이터의 특정 패턴으로 보임 (제거)
+                cleaned_text = re.sub(r'<paragraph[^>]*>|.*?:/|</paragraph>', '', cleaned_text)
+                cleaned_text = re.sub(r'&lt;.*?&gt;', '', cleaned_text)
+
+                # 텍스트 정리: 여러 개의 공백이나 마스킹 문자가 연속될 경우 하나로 합치고, 앞뒤 공백 제거
+                chinese_text = re.sub(r'\s+', ' ', cleaned_text).strip() # 공백 정리
+                # 지정된 마스킹 문자가 연속될 경우 하나로 합치기
+                chinese_text = re.sub(f'{re.escape(masking_char)}+', masking_char, chinese_text).strip()
+
+            # 6. 결과 저장 (ID에서 날짜 정보를 다시 추출하여 '발행일' 필드 생성)
+            try:
+                # ID 형식: sillok.taejo.02.04.001 (5:12가 날짜)
+                year_part = int(article_id[5:7])
+                month_part = int(article_id[7:9])
+                day_part = int(article_id[9:12])
+            except ValueError:
+                # 날짜 파트가 숫자가 아닐 경우를 대비
+                year_part, month_part, day_part = 'N/A', 'N/A', 'N/A'
+
+
+            extracted_data.append({
+                "ID": article_id,
+                "발행일": f"태조 {year_part}년 {month_part}월 {day_part}일",
+                "기사제목": title,
+                "본문내용_한문_원문_마스킹": chinese_text
+            })
+
+    return extracted_data
+
+# ==========================================================================
+# 🚀 메인 실행 블록 (Main Execution Block)
+# ==========================================================================
+
+if __name__ == "__main__":
+    print("="*50)
+    print("👑 조선왕조실록 (태조 2년) XML 데이터 추출 및 마스킹 프로그램 👑")
+    print("="*50)
+
+    # 1. 대상 날짜 ID 리스트 생성
+    target_dates_list = get_target_dates_id_list(START_DATE_ISO, EXCLUSIVE_END_DATE_ISO)
+
+    print(f"⭐ 추출 대상 기간: {START_DATE_KOREAN}부터 {END_DATE_KOREAN}까지 ({len(target_dates_list)}일)")
+    print(f"⭐ 마스킹 문자: '{MASKING_CHAR}'")
+    print("-" * 50)
+
+    final_results = []
+
+    # 2. 지정된 모든 XML 파일 처리
+    for file in XML_FILES_TO_PROCESS:
+        results = parse_xml_for_sillok_data(file, set(target_dates_list), MASKING_CHAR)
+        final_results.extend(results)
+
+    # 3. 데이터프레임 생성 및 정리
+    if final_results:
+        df_final = pd.DataFrame(final_results)
+
+        # ID 기준으로 중복 기사 제거 및 정렬
+        initial_count = len(df_final)
+        df_final.drop_duplicates(subset=['ID'], inplace=True)
+        final_count = len(df_final)
+
+        if initial_count != final_count:
+            print(f"\n⚠️ 중복 기사 {initial_count - final_count}개 제거됨.")
+
+        df_final.sort_values(by='ID', inplace=True)
+
+        # 4. TSV 파일로 저장
+        try:
+            df_final.to_csv(OUTPUT_FILENAME, index=False, encoding='utf-8-sig', sep='\t', quoting=1)
+
+            print("\n" + "="*50)
+            print(f"🎉 총 {len(df_final)}개의 기사 추출 및 저장 완료!")
+            print(f"**결과 파일명: {OUTPUT_FILENAME}** (인코딩: UTF-8-sig, 구분자: Tab)")
+            print("="*50)
+
+            # 추출된 데이터의 상위 5개 출력
+            print("\n--- 추출 결과 미리보기 ---")
+            print(df_final.head().to_markdown(index=False)) # Markdown 형식으로 출력하여 가독성 높임
+
+        except Exception as e:
+            print(f"\n❌ 오류: 결과 파일을 저장하는 데 실패했습니다. ({e})")
+
+    else:
+        print("\n수집된 데이터가 없습니다.")
+        print("💡 파일을 찾지 못했거나 파일 내에 지정된 기간의 기사가 없는지 확인해주세요.")
